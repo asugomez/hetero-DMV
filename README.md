@@ -6,6 +6,9 @@ Detector** to CSV, JSON, XML, and RDF. The command-line tool is
 missing values (DMVs), reports the candidate values and detector scores, and
 writes a cleaned copy of the input.
 
+[`fahes_structured_v2.py`](./fahes_structured_v2.py) uses the same detector but
+deletes XML elements whose text is identified as a DMV.
+
 ## How FAHES is used in this work
 
 FAHES was designed for CSV tables. For CSV, this script profiles the headered
@@ -22,18 +25,30 @@ format and group them into fields:
 | RDF | Predicate IRI | RDF subject |
 
 For each profiled field, the script applies four Fahes-inspired signals and
-unions their candidates:
+unions their candidates. XML also has a cross-field placeholder signal:
+repeated bracketed text shared by at least three element or attribute paths is
+treated as a missing-value marker and its text or attribute value is cleared.
+This supports common published placeholders such as `[Données non publiées]`,
+including fields whose values are all placeholders.
 
-1. **Syntactic outliers:** values whose character-class pattern (letters,
-   digits, spaces, and punctuation) is rare among distinct field values.
+1. **Syntactic outliers:** values whose character-class pattern (alphanumeric
+   runs, spaces, and punctuation) is rare among distinct field values. This
+   signal is used only when a field has a clearly dominant pattern, avoiding
+   rare-pattern false positives in highly variable free-text fields. A
+   candidate must also occur in at least 5% of the field values or be a short
+   symbolic marker.
 2. **Repeated patterns:** long values dominated by repeated characters or
    substrings.
 3. **Numeric density:** frequent numeric candidates whose leave-one-value-out
    Gaussian-kernel density is low compared with the field's estimated peak
-   density. Multiple bandwidths are considered.
+   density. At least 50 numeric observations are required; scores use the
+   median across multiple bandwidths, and contiguous integer domains are
+   treated as discrete values rather than outliers.
 4. **RandomDMVD-style sampling:** frequent values are tested to see whether
    records containing them resemble the overall data in selected other fields,
-   using the paper's mutual-information comparison idea.
+   using the paper's mutual-information comparison idea. Sampling is limited to
+   fields with at least 20 values and candidates occurring in 5%–25% of them,
+   avoiding small-field and near-constant-category false positives.
 
 Scores are on a 0–1 scale; higher scores are stronger candidate signals. The
 default cutoff is **strictly greater than 0.99**, following the paper's
@@ -91,6 +106,15 @@ python fahes_structured.py data/mondial/mondial.xml
 python fahes_structured.py data/dblp/all-clean-original-direction.nt
 ```
 
+Use version 2 to remove detected XML text elements rather than retaining empty
+elements:
+
+```bash
+python fahes_structured_v2.py data/mondial/mondial.xml
+```
+
+Version 2 keeps the original cleaning behavior for CSV, JSON, and RDF.
+
 Choose a specific output path with `-o` / `--output`:
 
 ```bash
@@ -126,6 +150,9 @@ status.
   row order are retained.
 - **XML:** detected text is emptied; a detected attribute is removed. The
   element and its other content are retained.
+- **XML with version 2:** a detected text element is removed from its parent;
+  detected attributes are removed as in the original version. The document
+  root itself cannot be removed, so detected root text is emptied.
 - **RDF:** triples with a detected predicate/object value are removed. Both
   literal and resource objects can be considered.
 
@@ -152,6 +179,4 @@ The RDF test runs when `rdflib` is installed; otherwise it is skipped.
 
 - Qahtan et al., “FAHES: A Robust Disguised Missing Values Detector,” KDD 2018,
   [DOI: 10.1145/3219819.3220109](https://doi.org/10.1145/3219819.3220109).
-  The paper is included locally as [`fahes.md`](./fahes.md) and
-  [`fahes.pdf`](./fahes.pdf).
 - [QCRI Fahes_Demo repository](https://github.com/qcri/Fahes_Demo/tree/master).

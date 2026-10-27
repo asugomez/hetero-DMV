@@ -125,8 +125,19 @@ def _csv_profile(rows: list[list[str]], headers: list[str]) -> Profile:
     return profile
 
 
-def _xml_profile(root: ET.Element) -> Profile:
+def _xml_profile(root: ET.Element, delete_labels: bool = False) -> Profile:
     profile = Profile()
+    parents = {
+        child: element
+        for element in root.iter()
+        for child in element
+    }
+
+    def clear_text(node: ET.Element) -> None:
+        if delete_labels and node in parents:
+            parents[node].remove(node)
+        else:
+            node.text = None
 
     def walk(element: ET.Element, path: str) -> None:
         row = id(element)
@@ -151,7 +162,7 @@ def _xml_profile(root: ET.Element) -> Profile:
                     field_name,
                     element.text.strip(),
                     row,
-                    lambda node=element: setattr(node, "text", None),
+                    lambda node=element: clear_text(node),
                 )
             )
         for child in children:
@@ -181,7 +192,7 @@ def _xml_profile(root: ET.Element) -> Profile:
                             child_path,
                             child.text.strip(),
                             child_row,
-                            lambda node=child: setattr(node, "text", None),
+                            lambda node=child: clear_text(node),
                         )
                     )
 
@@ -243,9 +254,7 @@ def _value_key(value: Any) -> str:
 def _pattern(value: str) -> str:
     parts: list[str] = []
     for character in value:
-        if character.isdigit():
-            current = "d"
-        elif character.isupper() or character.islower():
+        if character.isalnum():
             current = "a"
         elif character.isspace():
             current = " "
@@ -294,7 +303,12 @@ def _numeric_outlier_scores(values: list[Any]) -> dict[str, float]:
     numeric = [number for number in numbers if number is not None]
     frequencies = Counter(numeric)
     distinct = sorted(frequencies)
-    if len(distinct) < 6 or len(numeric) < 10:
+    if len(distinct) < 6 or len(numeric) < 50:
+        return {}
+    if (
+        all(number.is_integer() for number in distinct)
+        and distinct[-1] - distinct[0] + 1 == len(distinct)
+    ):
         return {}
 
     standard_deviation = statistics.pstdev(numeric)
@@ -335,7 +349,7 @@ def _numeric_outlier_scores(values: list[Any]) -> dict[str, float]:
         width = 1.06 * statistics.pstdev(sample) * len(sample) ** (-0.2)
         if width <= 0:
             continue
-        candidate_density = min(
+        candidate_density = statistics.median(
             density(candidate, support, remaining, width * scale)
             for scale in (1.0, 0.8, 0.6, 0.4, 0.2)
         )
@@ -347,6 +361,8 @@ def _numeric_outlier_scores(values: list[Any]) -> dict[str, float]:
 
 
 def _random_sample_scores(profile: Profile, field_name: str, values: list[Any]) -> dict[str, float]:
+    if len(values) < 20:
+        return {}
     other_fields = sorted(
         {
             name
@@ -363,7 +379,8 @@ def _random_sample_scores(profile: Profile, field_name: str, values: list[Any]) 
     counts = Counter(_value_key(value) for value in values)
     all_field_count = len(values)
     for candidate, frequency in counts.items():
-        if frequency < 2 or frequency / max(1, all_field_count) < 0.05:
+        frequency_ratio = frequency / all_field_count
+        if frequency < 2 or frequency_ratio < 0.05 or frequency_ratio > 0.25:
             continue
         subset = [row for row in rows if _value_key(row[field_name]) == candidate]
         if len(subset) < 2:
@@ -433,10 +450,22 @@ def detect_dmvs(profile: Profile, threshold: float = 0.99) -> dict[str, dict[str
             continue
 
         pattern_counts = Counter(_pattern(value) for value in distinct)
+        if max(pattern_counts.values()) / len(distinct) < 0.25:
+            continue
+        value_counts = Counter(_value_key(value) for value in values)
         for value in distinct:
             pattern = _pattern(value)
             score = 1.0 - pattern_counts[pattern] / len(distinct)
-            if score > threshold and pattern_counts[pattern] / len(distinct) < 0.01:
+            numeric_text = value.replace(" ", "")
+            if re.fullmatch(r"[+-]?(?:\d+(?:[.,]\d*)?|[.,]\d+)%?", numeric_text):
+                continue
+            is_short_marker = len(value) <= 4 and not value.isalnum()
+            is_frequent_value = value_counts[value] / len(values) >= 0.05
+            if (
+                (is_frequent_value or is_short_marker)
+                and score > threshold
+                and pattern_counts[pattern] / len(distinct) < 0.01
+            ):
                 detected.setdefault(field_name, {}).setdefault(value, {})["syntactic"] = score
 
         longest = max((len(value) for value in distinct), default=0)
@@ -456,7 +485,33 @@ def detect_dmvs(profile: Profile, threshold: float = 0.99) -> dict[str, dict[str
     return detected
 
 
-def _load(path: Path) -> tuple[Any, Profile, Callable[[Path], None]]:
+def _xml_placeholder_candidates(profile: Profile) -> dict[str, dict[str, dict[str, float]]]:
+    by_marker: dict[str, dict[str, Counter[str]]] = defaultdict(
+        lambda: defaultdict(Counter)
+    )
+    for observation in profile.observations:
+        value = _value_key(observation.value)
+        if re.fullmatch(r"\[[^\[\]\r\n]+\]", value):
+            by_marker[value.casefold()][observation.field][value] += 1
+
+    candidates: dict[str, dict[str, dict[str, float]]] = {}
+    for fields in by_marker.values():
+        supporting_fields = sum(
+            sum(value_counts.values()) >= 2 for value_counts in fields.values()
+        )
+        if supporting_fields < 3:
+            continue
+        for field_name, value_counts in fields.items():
+            for value in value_counts:
+                candidates.setdefault(field_name, {}).setdefault(value, {})[
+                    "xml-placeholder"
+                ] = 1.0
+    return candidates
+
+
+def _load(
+    path: Path, delete_xml_labels: bool = False
+) -> tuple[Any, Profile, Callable[[Path], None]]:
     suffix = path.suffix.lower()
     if suffix == ".csv":
         with path.open("r", encoding="utf-8-sig", newline="") as source:
@@ -486,9 +541,15 @@ def _load(path: Path) -> tuple[Any, Profile, Callable[[Path], None]]:
         root = ET.parse(path, parser=parser).getroot()
 
         def write_xml(output: Path) -> None:
-            ET.ElementTree(root).write(output, encoding="utf-8", xml_declaration=True)
+            tree = ET.ElementTree(root)
+            tree.write(
+                output,
+                encoding="utf-8",
+                xml_declaration=True,
+                short_empty_elements=False,
+            )
 
-        return root, _xml_profile(root), write_xml
+        return root, _xml_profile(root, delete_xml_labels), write_xml
     if suffix in {".nt", ".n3", ".ttl", ".rdf", ".owl", ".trig", ".nq", ".jsonld"}:
         try:
             from rdflib import Graph
@@ -507,9 +568,19 @@ def _load(path: Path) -> tuple[Any, Profile, Callable[[Path], None]]:
     raise ValueError(f"Unsupported input format: {suffix or '(no extension)'}")
 
 
-def process(input_path: Path, output_path: Path, in_place: bool, threshold: float) -> int:
-    _, profile, write_output = _load(input_path)
+def process(
+    input_path: Path,
+    output_path: Path,
+    in_place: bool,
+    threshold: float,
+    delete_xml_labels: bool = False,
+) -> int:
+    _, profile, write_output = _load(input_path, delete_xml_labels)
     candidates = detect_dmvs(profile, threshold)
+    if input_path.suffix.lower() == ".xml":
+        for field_name, values in _xml_placeholder_candidates(profile).items():
+            for value, scores in values.items():
+                candidates.setdefault(field_name, {}).setdefault(value, {}).update(scores)
     selected = {
         (field_name, value)
         for field_name, values in candidates.items()
@@ -542,7 +613,9 @@ def process(input_path: Path, output_path: Path, in_place: bool, threshold: floa
     return removed
 
 
-def main(argv: Iterable[str] | None = None) -> int:
+def main(
+    argv: Iterable[str] | None = None, *, delete_xml_labels: bool = False
+) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", type=Path, help="Input CSV, JSON, XML, or RDF file")
     parser.add_argument("-o", "--output", type=Path, help="Cleaned output path")
@@ -568,7 +641,13 @@ def main(argv: Iterable[str] | None = None) -> int:
         f"{input_path.stem}.cleaned{input_path.suffix}"
     )
     try:
-        process(input_path, output_path, arguments.in_place, arguments.threshold)
+        process(
+            input_path,
+            output_path,
+            arguments.in_place,
+            arguments.threshold,
+            delete_xml_labels,
+        )
     except (
         OSError,
         ValueError,
