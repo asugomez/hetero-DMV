@@ -1,4 +1,4 @@
-# Hetero-MDV: FAHES-style disguised missing-value detection
+# Hetero-DMV: FAHES-style disguised missing-value detection
 
 This project applies and adapts the ideas in **FAHES: A Robust Disguised Missing Values
 Detector** to CSV, JSON, XML, and RDF. The command-line tool is
